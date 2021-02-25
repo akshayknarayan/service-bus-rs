@@ -1,34 +1,28 @@
-use std::time::Duration;
-use std::cell::RefCell;
-use std::sync::Mutex;
-
-use core::generate_sas;
-use core::error::AzureRequestError;
 use super::brokeredmessage::*;
-
-use url;
-use time2;
-use hyper::client::Client;
+use crate::core::error::AzureRequestError;
+use crate::core::generate_sas;
+use eyre::Report;
 use hyper::header::*;
-use hyper::status::StatusCode;
+use hyper::{Request, Uri};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::time::Duration;
 
 const SAS_BUFFER_TIME: usize = 15;
 
-// Ideally this should be a field on the client, but we don't want to expose it through
-// the trait, and if we don't then we can't share code.
-lazy_static!{
-    static ref CLIENT: Client = Client::new();
+/// Client for sending and receiving messages from a Service Bus Subscription in Azure.
+/// This cient is `!Sync` because it internally uses a RefCell to keep track of
+/// its authorization token, but it is still ideal for single threaded use.
+pub struct SubscriptionClient {
+    connection_string: String,
+    topic_name: String,
+    subscription_name: String,
+    endpoint: Uri,
+    sas_info: Arc<Mutex<(String, usize)>>,
 }
 
 /// The Subscription Trait is an abstraction over different types of Subscription that
-/// can be used when communicating with an Azure Service Bus Queue. The concurrent version
-/// is both send and sync. All methods take a reference to the client so the ConcurrentQueueClient
-/// can be used across multiple threads by simply wrapping it in an Arc<T>. The only step that is
-/// synchronized is regenerating the auth key so prefer this struct to using an Arc<Mutex<Queue>>
-///
-/// The non-concurrent version isn't Sync because it internally uses a RefCell to hide the fact
-/// that it will generate new credentials occasionally. Prefer this version if you don't need
-/// synchronization as it avoids the overhead of obtaining a mutex lock.
+/// can be used when communicating with an Azure Service Bus Queue.
 ///
 /// Topics and subscriptions work together hand in hand. Together they provide similar functionality
 /// to queues. Producers send message to the topic. Consumers then create a subscription to the
@@ -38,28 +32,65 @@ lazy_static!{
 /// servers as described in the Queue page. Another subscription will log every message as they come in
 /// in a different subscription. This way different processes can consume the message and not interfere
 /// with each other or have to worry about losing messages.
-pub trait Subscription
-    where Self: Sized
-{
-    /// The subscription name.
-    fn subscription(&self) -> &str;
+impl SubscriptionClient {
+    /// Create a new subscription with a connection string, the name of a
+    /// topic, and the name of a subscription.
+    /// The connection string can be copied and pasted from the azure portal.
+    /// The subscription name should be the name of an existing subscription.
+    pub fn with_conn_topic_and_subscr(
+        connection_string: &str,
+        topic: &str,
+        subscription: &str,
+    ) -> Result<SubscriptionClient, Report> {
+        let duration = Duration::from_secs(60 * 6);
+        let mut endpoint = String::new();
+        for param in connection_string.split(";") {
+            let idx = param.find("=").unwrap_or(0);
+            let (mut k, mut value) = param.split_at(idx);
+            k = k.trim();
+            value = value.trim();
+            // cut out the equal sign if there was one.
+            if value.len() > 0 {
+                value = &value[1..]
+            }
+            match k {
+                "Endpoint" => endpoint = value.to_string(),
+                _ => {}
+            };
+        }
+        endpoint = String::new() + "https" + endpoint.split_at(endpoint.find(":").unwrap_or(0)).1;
+        let url = endpoint.parse()?;
 
-    /// The topic name.
-    fn topic(&self) -> &str;
+        let (sas_key, expiry) = generate_sas(connection_string, duration);
+        let conn_string = connection_string.to_string();
 
-    /// Regenerates the SAS string if it is close to expiring. Returns a valid SAS string
-    /// This function may return the same String multiple times.
-    fn refresh_sas(&self) -> String;
+        Ok(SubscriptionClient {
+            connection_string: conn_string,
+            subscription_name: subscription.to_string(),
+            topic_name: topic.to_string(),
+            endpoint: url,
+            sas_info: Arc::new(Mutex::new((sas_key, expiry - SAS_BUFFER_TIME))),
+        })
+    }
+
+    pub fn subscription(&self) -> &str {
+        &self.subscription_name
+    }
+
+    pub fn topic(&self) -> &str {
+        &self.topic_name
+    }
 
     /// The endpoint for the Queue. `http://{namespace}.servicebus.net/`
-    fn endpoint(&self) -> &url::Url;
-
+    pub fn endpoint(&self) -> &Uri {
+        &self.endpoint
+    }
 
     /// Receive a message from the subscription. Returns either the deserialized message or an error
     /// detailing what went wrong. The message will not be deleted on the server until
     /// `queue_client.complete_message(message)` is called. This is ideal for applications that
     /// can't afford to miss a message.
-    fn receive(&self) -> Result<BrokeredMessage, AzureRequestError> {
+    pub fn receive(&self) -> Result<Request<()>, Report> {
         let timeout = Duration::from_secs(30);
         self.receive_with_timeout(timeout)
     }
@@ -67,7 +98,7 @@ pub trait Subscription
     /// Receive a message from the subscription. Returns the deserialized message or an error.
     /// The message is deleted from the subscription when it is received. If the application crashes,
     /// the contents of the message can be lost.
-    fn receive_and_delete(&self) -> Result<BrokeredMessage, AzureRequestError> {
+    pub fn receive_and_delete(&self) -> Result<Request<()>, Report> {
         let timeout = Duration::from_secs(30);
         self.receive_and_delete_with_timeout(timeout)
     }
@@ -75,45 +106,46 @@ pub trait Subscription
     /// Receive a message from the subscription. Returns the deserialized message or an error.
     /// The message is deleted from the subscription when it is received. If the application crashes,
     /// the contents of the message can be lost.
-    fn receive_and_delete_with_timeout(&self,
-                                       timeout: Duration)
-                                       -> Result<BrokeredMessage, AzureRequestError> {
-
+    pub fn receive_and_delete_with_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<Request<()>, Report> {
         let sas = self.refresh_sas();
-        let path = format!("{}/subscriptions/{}/messages/head?timeout={}",
-                           self.topic(),
-                           self.subscription(),
-                           timeout.as_secs());
 
-        let uri = self.endpoint().join(&path)?;
-        let mut header = Headers::new();
-        header.set(Authorization(sas));
+        let mut parts = self.endpoint().clone().into_parts();
+        parts.path_and_query = Some(
+            format!(
+                "{}/subscriptions/{}/messages/head?timeout={}",
+                self.topic(),
+                self.subscription(),
+                timeout.as_secs()
+            )
+            .parse()?,
+        );
+        let uri = Uri::from_parts(parts)?;
 
-        let response = CLIENT.delete(uri).headers(header).send()?;
-        interpret_results(response.status)?;
-        Ok(BrokeredMessage::with_response(response))
+        Ok(Request::delete(uri).header(AUTHORIZATION, sas).body(())?)
     }
 
     /// Receive a message from the subscription. Returns either the deserialized message or an error
     /// detailing what went wrong. The message will not be deleted on the server until
     /// `subscription_client.complete_message(message)` is called. This is ideal for applications that
     /// can't afford to miss a message. Allows a timeout to be specified for greater control.
-    fn receive_with_timeout(&self,
-                            timeout: Duration)
-                            -> Result<BrokeredMessage, AzureRequestError> {
+    pub fn receive_with_timeout(&self, timeout: Duration) -> Result<Request<()>, Report> {
         let sas = self.refresh_sas();
-        let path = format!("{}/subscriptions/{}/messages/head?timeout={}",
-                           self.topic(),
-                           self.subscription(),
-                           timeout.as_secs());
+        let mut parts = self.endpoint().clone().into_parts();
+        parts.path_and_query = Some(
+            format!(
+                "{}/subscriptions/{}/messages/head?timeout={}",
+                self.topic(),
+                self.subscription(),
+                timeout.as_secs()
+            )
+            .parse()?,
+        );
+        let uri = Uri::from_parts(parts)?;
 
-        let uri = self.endpoint().join(&path)?;
-
-        let mut header = Headers::new();
-        header.set(Authorization(sas));
-        let response = CLIENT.post(uri).headers(header).send()?;
-        interpret_results(response.status)?;
-        Ok(BrokeredMessage::with_response(response))
+        Ok(Request::post(uri).header(AUTHORIZATION, sas).body(())?)
     }
 
     /// Completes a message that has been received from the Service Bus. This will fail
@@ -124,35 +156,21 @@ pub trait Subscription
     /// // Do lots of processing with the message. Send it to another database.
     /// my_subscription.complete_message(message);
     /// ```
-    fn complete_message(&self, message: BrokeredMessage) -> Result<(), AzureRequestError> {
+    pub fn complete_message(&self, message: BrokeredMessage) -> Result<Request<()>, Report> {
         let sas = self.refresh_sas();
-
-        // Take either the Sequence number or the Message ID
-        // Then add the lock token and finally join it into the targer
-        let target = get_message_update_path(self, &message)?;
-
-        let mut header = Headers::new();
-        header.set(Authorization(sas));
-        let response = CLIENT.delete(target).headers(header).send()?;
-        interpret_results(response.status)
-
+        let target = self.get_message_update_path(&message)?;
+        Ok(Request::delete(target)
+            .header(AUTHORIZATION, sas)
+            .body(())?)
     }
 
     /// Releases the lock on a message and puts it back into the queue.
     /// This method generally indicates that the message could not be
     /// handled properly and should be attempted at a later time.
-    fn abandon_message(&self, message: BrokeredMessage) -> Result<(), AzureRequestError> {
+    pub fn abandon_message(&self, message: BrokeredMessage) -> Result<Request<()>, Report> {
         let sas = self.refresh_sas();
-
-        // Take either the Sequence number or the Message ID
-        // Then add the lock token and finally join it into the targer
-        let target = get_message_update_path(self, &message)?;
-
-        let mut header = Headers::new();
-        header.set(Authorization(sas));
-        let response = CLIENT.put(target).headers(header).send()?;
-        interpret_results(response.status)
-
+        let target = self.get_message_update_path(&message)?;
+        Ok(Request::put(target).header(AUTHORIZATION, sas).body(())?)
     }
 
     /// Renews the lock on a message. If a message is received by calling
@@ -170,247 +188,56 @@ pub trait Subscription
     /// sleep(2*60*1000);
     /// subscription.complete_message(message);
     /// ```
-    fn renew_message(&self, message: &BrokeredMessage) -> Result<(), AzureRequestError> {
+    pub fn renew_message(&self, message: &BrokeredMessage) -> Result<Request<()>, Report> {
         let sas = self.refresh_sas();
+        let target = self.get_message_update_path(&message)?;
+        Ok(Request::post(target).header(AUTHORIZATION, sas).body(())?)
+    }
 
+    // Complete, Abandon, Renew all make calls to the same Uri so here's a quick function
+    // for generating it.
+    fn get_message_update_path(&self, message: &BrokeredMessage) -> Result<Uri, AzureRequestError> {
         // Take either the Sequence number or the Message ID
         // Then add the lock token and finally join it into the targer
-        let target = get_message_update_path(self, &message)?;
-
-        let mut header = Headers::new();
-        header.set(Authorization(sas));
-        let response = CLIENT.post(target).headers(header).send()?;
-        interpret_results(response.status)
+        message
+            .props
+            .SequenceNumber
+            .map(|seq| seq.to_string())
+            .or(message.props.MessageId.clone())
+            .and_then(|id| message.props.LockToken.as_ref().map(|lock| (id, lock)))
+            .map(|(id, lock)| {
+                format!(
+                    "{}/subscriptions/{}/messages/{}/{}",
+                    self.topic(),
+                    self.subscription(),
+                    id,
+                    lock
+                )
+            })
+            .and_then(|path| {
+                let mut parts = self.endpoint().clone().into_parts();
+                parts.path_and_query = Some(path.parse().ok()?);
+                Uri::from_parts(parts).ok()
+            })
+            .ok_or(AzureRequestError::LocalMessage)
     }
 
-    /// Creates an event loop for handling messages that blocks the current thread.
-    ///
-    /// ```
-    /// subscription.on_message(|message| {
-    ///     // Do message processing
-    ///     subscription.complete_message(message);
-    /// });
-    /// ```
-    fn on_message<H>(&self, handler: H) -> AzureRequestError
-        where H: Fn(BrokeredMessage)
-    {
-        loop {
-            let res = self.receive_and_delete();
-            match res {
-                Ok(message) => handler(message),
-                Err(AzureRequestError::EmptyBus) => {}
-                Err(e) => return e,
-            }
-        }
-    }
-}
-
-/// Client for sending and receiving messages from a Service Bus Subscription in Azure.
-/// This cient is `!Sync` because it internally uses a RefCell to keep track of
-/// its authorization token, but it is still ideal for single threaded use.
-pub struct SubscriptionClient {
-    connection_string: String,
-    topic_name: String,
-    subscription_name: String,
-    endpoint: url::Url,
-    sas_info: RefCell<(String, usize)>,
-}
-
-impl SubscriptionClient {
-    /// Create a new subscription with a connection string, the name of a
-    /// topic, and the name of a subscription.
-    /// The connection string can be copied and pasted from the azure portal.
-    /// The subscription name should be the name of an existing subscription.
-    pub fn with_conn_topic_and_subscr(connection_string: &str,
-                                      topic: &str,
-                                      subscription: &str)
-                                      -> Result<SubscriptionClient, url::ParseError> {
-        let duration = Duration::from_secs(60 * 6);
-        let mut endpoint = String::new();
-        for param in connection_string.split(";") {
-            let idx = param.find("=").unwrap_or(0);
-            let (mut k, mut value) = param.split_at(idx);
-            k = k.trim();
-            value = value.trim();
-            // cut out the equal sign if there was one.
-            if value.len() > 0 {
-                value = &value[1..]
-            }
-            match k {
-                "Endpoint" => endpoint = value.to_string(),
-                _ => {}
-            };
-        }
-        endpoint = String::new() + "https" + endpoint.split_at(endpoint.find(":").unwrap_or(0)).1;
-        let url = url::Url::parse(&endpoint)?;
-
-        let (sas_key, expiry) = generate_sas(connection_string, duration);
-        let conn_string = connection_string.to_string();
-
-        Ok(SubscriptionClient {
-            connection_string: conn_string,
-            subscription_name: subscription.to_string(),
-            topic_name: topic.to_string(),
-            endpoint: url,
-            sas_info: RefCell::new((sas_key, expiry - SAS_BUFFER_TIME)),
-        })
-    }
-}
-
-impl Subscription for SubscriptionClient {
-    fn subscription(&self) -> &str {
-        &self.subscription_name
-    }
-
-    fn topic(&self) -> &str {
-        &self.topic_name
-    }
-
-    fn endpoint(&self) -> &url::Url {
-        &self.endpoint
-    }
-
-    fn refresh_sas(&self) -> String {
-        let curr_time = time2::now_utc().to_timespec().sec as usize;
-        let mut sas_tuple = self.sas_info.borrow_mut();
-        if curr_time > sas_tuple.1 {
-            let duration = Duration::from_secs(60 * 6);
-            let (key, expiry) = generate_sas(&*self.connection_string, duration);
-            sas_tuple.1 = expiry;
-            sas_tuple.0 = key;
-        }
-        sas_tuple.0.clone()
-    }
-}
-
-/// The ConcurrentSubscriptionClient has all the same methods as SubscriptionClient, but it is also
-/// `Sync`. This means that it can be shared between threads. Prefer using a Arc<ConcurrentQueueClient>
-/// over an Arc<Mutex<SubscriptionClient>> to share the thread between queues.
-///
-/// ```
-/// use std::thread;
-/// let subscr = Arc::new(ConcurrentSubscriptionClient::with_conn_topic_and_subscr(conn,topic,subscription));
-/// for _ in 0..10 {
-///     let s = subscr.clone();
-///     thread::spawn(move || {
-///         s.send(BrokeredMessage::with_body("Sending a concurrent message"));
-///     });
-/// }
-/// ```
-pub struct ConcurrentSubscriptionClient {
-    connection_string: String,
-    topic_name: String,
-    subscription_name: String,
-    endpoint: url::Url,
-    sas_info: Mutex<(String, usize)>,
-}
-
-impl ConcurrentSubscriptionClient {
-    pub fn with_conn_topic_and_subscr(connection_string: &str,
-                                      topic: &str,
-                                      subscription: &str)
-                                      -> Result<ConcurrentSubscriptionClient, url::ParseError> {
-        let duration = Duration::from_secs(60 * 6);
-        let mut endpoint = String::new();
-        for param in connection_string.split(";") {
-            let idx = param.find("=").unwrap_or(0);
-            let (mut k, mut value) = param.split_at(idx);
-            k = k.trim();
-            value = value.trim();
-            // cut out the equal sign if there was one.
-            if value.len() > 0 {
-                value = &value[1..]
-            }
-            match k {
-                "Endpoint" => endpoint = value.to_string(),
-                _ => {}
-            };
-        }
-        endpoint = String::new() + "https" + endpoint.split_at(endpoint.find(":").unwrap_or(0)).1;
-        let url = url::Url::parse(&endpoint)?;
-        let (sas_key, expiry) = generate_sas(connection_string, duration);
-        let conn_string = connection_string.to_string();
-
-        Ok(ConcurrentSubscriptionClient {
-            connection_string: conn_string,
-            subscription_name: subscription.to_string(),
-            topic_name: topic.to_string(),
-            endpoint: url,
-            sas_info: Mutex::new((sas_key, expiry - SAS_BUFFER_TIME)),
-        })
-    }
-}
-
-impl Subscription for ConcurrentSubscriptionClient {
-    fn subscription(&self) -> &str {
-        &self.subscription_name
-    }
-
-    fn topic(&self) -> &str {
-        &self.topic_name
-    }
-
-    fn endpoint(&self) -> &url::Url {
-        &self.endpoint
-    }
-
-    fn refresh_sas(&self) -> String {
-        let curr_time = time2::now_utc().to_timespec().sec as usize;
+    fn refresh_sas(&self) -> HeaderValue {
+        let curr_time = std::time::SystemTime::UNIX_EPOCH
+            .elapsed()
+            .expect("unix epoch time comparison")
+            .as_secs();
         let mut sas_tuple = match self.sas_info.lock() {
             Ok(guard) => guard,
             Err(poison) => poison.into_inner(),
         };
-        if curr_time > sas_tuple.1 {
+        if curr_time > (sas_tuple.1 as _) {
             let duration = Duration::from_secs(60 * 6);
             let (key, expiry) = generate_sas(&*self.connection_string, duration);
             sas_tuple.1 = expiry;
             sas_tuple.0 = key;
         }
-        sas_tuple.0.clone()
+
+        HeaderValue::from_str(&sas_tuple.0).unwrap()
     }
-}
-
-
-// Here's one function that interprets what all of the error codes mean for consistency.
-// This might even get elevated out of this module, but preferabbly not.
-fn interpret_results(status: StatusCode) -> Result<(), AzureRequestError> {
-    use core::error::AzureRequestError::*;
-    match status {
-        StatusCode::Unauthorized => Err(AuthorizationFailure),
-        StatusCode::InternalServerError => Err(InternalError),
-        StatusCode::BadRequest => Err(BadRequest),
-        StatusCode::Forbidden => Err(ResourceFailure),
-        StatusCode::Gone => Err(ResourceNotFound),
-        // These are the successful cases.
-        StatusCode::Created => Ok(()),
-        StatusCode::Ok => Ok(()),
-        _ => Err(UnknownError),
-    }
-}
-
-// Complete, Abandon, Renew all make calls to the same Uri so here's a quick function
-// for generating it.
-fn get_message_update_path<T>(q: &T,
-                              message: &BrokeredMessage)
-                              -> Result<url::Url, AzureRequestError>
-    where T: Subscription
-{
-
-    // Take either the Sequence number or the Message ID
-    // Then add the lock token and finally join it into the targer
-    let target = message.props
-        .SequenceNumber
-        .map(|seq| seq.to_string())
-        .or(message.props.MessageId.clone())
-        .and_then(|id| message.props.LockToken.as_ref().map(|lock| (id, lock)))
-        .map(|(id, lock)| {
-            format!("{}/subscriptions/{}/messages/{}/{}",
-                    q.topic(),
-                    q.subscription(),
-                    id,
-                    lock)
-        })
-        .and_then(|path| q.endpoint().join(&*path).ok())
-        .ok_or(AzureRequestError::LocalMessage);
-    target
 }

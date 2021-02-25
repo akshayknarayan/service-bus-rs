@@ -1,28 +1,37 @@
-use hyper;
-use url;
-use std::fmt::{Display, Formatter, Result};
-use std::error::Error;
+use eyre::Report;
 use std::convert::From;
+use std::error::Error;
+use std::fmt::{Display, Formatter, Result};
 
 #[derive(Debug)]
 pub enum AzureRequestError {
-    BadRequest, // StatusCode 400
-    AuthorizationFailure, // StatusCode 401
-    ResourceFailure, // StatusCode 403
-    ResourceNotFound, // StatusCode 410
-    InternalError, // StatusCode 500
-    UnknownError, // Catch All
-    InvalidEndpoint(url::ParseError), // Failure to parse URL
-    HyperError(hyper::error::Error), // Hyper threw an error sending the request.
-    LocalMessage, // The message doesn't exist on the server. You can't change it...
-    EmptyBus, // There was nothing in the bus to receive.
+    BadRequest,               // StatusCode 400
+    AuthorizationFailure,     // StatusCode 401
+    ResourceFailure,          // StatusCode 403
+    ResourceNotFound,         // StatusCode 410
+    InternalError,            // StatusCode 500
+    UnknownError(Report),     // Catch All
+    HyperError(hyper::Error), // Hyper threw an error sending the request.
+    LocalMessage,             // The message doesn't exist on the server. You can't change it...
+    EmptyBus,                 // There was nothing in the bus to receive.
     NonSerializedBody,
 }
 
 impl Error for AzureRequestError {
-    fn description(&self) -> &str {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
         use self::AzureRequestError::*;
         match self {
+            &UnknownError(ref e) => Some(e.as_ref()),
+            &HyperError(ref e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl Display for AzureRequestError {
+    fn fmt(&self, f: &mut Formatter) -> Result {
+        use self::AzureRequestError::*;
+        let s = match self {
             &BadRequest => "Remote returned code 400.",
             &AuthorizationFailure => "Remote returned 401. Check your connection string.",
             &ResourceFailure => {
@@ -30,8 +39,7 @@ impl Error for AzureRequestError {
             }
             &ResourceNotFound => "The requested queue does not exist or could not be found.",
             &InternalError => "Remote returned 500 - Internal server error",
-            &UnknownError => "Something unexpected happened",
-            &InvalidEndpoint(_) => "The provided URL could not be parsed",
+            &UnknownError(_) => "Something unexpected happened",
             &HyperError(_) => "Hyper had an issue making a web request",
             &LocalMessage => {
                 "The message doesn't exist on the server. This happens when you try and \
@@ -44,24 +52,14 @@ impl Error for AzureRequestError {
                 "Parsing the body failed. This happens if the message sender doesn't serialize the \
                  message. Call message.get_body_raw() to extract the body."
             }
-        }
+        };
+
+        f.write_str(s)
     }
 }
 
-impl Display for AzureRequestError {
-    fn fmt(&self, f: &mut Formatter) -> Result {
-        write!(f, "")
-    }
-}
-
-impl From<url::ParseError> for AzureRequestError {
-    fn from(err: url::ParseError) -> AzureRequestError {
-        AzureRequestError::InvalidEndpoint(err)
-    }
-}
-
-impl From<hyper::error::Error> for AzureRequestError {
-    fn from(err: hyper::error::Error) -> AzureRequestError {
+impl From<hyper::Error> for AzureRequestError {
+    fn from(err: hyper::Error) -> Self {
         AzureRequestError::HyperError(err)
     }
 }

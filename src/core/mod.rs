@@ -1,24 +1,42 @@
 pub mod error;
 
-use std::time;
-
-use time2;
-use crypto::mac::Mac;
 use crypto::hmac::Hmac;
+use crypto::mac::Mac;
 use crypto::sha2::*;
+use percent_encoding::utf8_percent_encode;
 
-use serialize::base64::{self, ToBase64};
-use url::percent_encoding::{utf8_percent_encode, USERINFO_ENCODE_SET, SIMPLE_ENCODE_SET};
+// space, double quote ("), hash (#), inequality qualifiers (<), (>), backtick (`), question mark (?),
+// and curly brackets ({), (}), forward slash (/), colon (:), semi-colon (;), equality
+// (=), at (@), backslash (\), square brackets ([), (]), caret (^), and pipe (|)
+const USERINFO_ENCODE_SET: percent_encoding::AsciiSet = percent_encoding::CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'<')
+    .add(b'>')
+    .add(b'`')
+    .add(b'?')
+    .add(b'{')
+    .add(b'}')
+    .add(b'/')
+    .add(b':')
+    .add(b';')
+    .add(b'=')
+    .add(b'@')
+    .add(b'\\')
+    .add(b'[')
+    .add(b']')
+    .add(b'^')
+    .add(b'|');
 
-/// This function generates a sas token for authenticating into azure
+const CUSTOM_ENCODE_SET: percent_encoding::AsciiSet =
+    percent_encoding::CONTROLS.add(b'+').add(b'=').add(b'/');
+
+/// This function generates an SAS token for authenticating into azure
 /// using the connection string provided on portal.azure.com.
 /// It will not raise an error if there is a mistake in the connection string,
 /// but the token will be invalid.
-pub fn generate_sas(connection_string: &str, duration: time::Duration) -> (String, usize) {
-    define_encode_set! {
-        pub CUSTOM_ENCODE_SET = [SIMPLE_ENCODE_SET] | {'+', '=', '/'}
-    }
-
+pub fn generate_sas(connection_string: &str, duration: std::time::Duration) -> (String, usize) {
     let mut key = "";
     let mut endpoint = "";
     let mut name = "";
@@ -43,21 +61,22 @@ pub fn generate_sas(connection_string: &str, duration: time::Duration) -> (Strin
 
     let mut h = Hmac::new(Sha256::new(), key.as_bytes());
 
-    let time2_duration = time2::Duration::from_std(duration).unwrap_or(time2::Duration::seconds(0));
-    let encoded_url = utf8_percent_encode(endpoint, USERINFO_ENCODE_SET).collect::<String>();
-    let expiry = (time2::now_utc() + time2_duration).to_timespec().sec;
+    let encoded_url = utf8_percent_encode(endpoint, &USERINFO_ENCODE_SET).collect::<String>();
+    let expiry = (std::time::SystemTime::now() + duration)
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap_or(std::time::Duration::from_secs(0))
+        .as_secs();
 
     let message = format!("{}\n{}", encoded_url, expiry);
     h.input(message.as_bytes());
 
-    let mut sig = h.result().code().to_base64(base64::STANDARD);
-    sig = utf8_percent_encode(&sig, CUSTOM_ENCODE_SET).collect::<String>();
+    let mut sig = base64::encode(h.result().code());
+    sig = utf8_percent_encode(&sig, &CUSTOM_ENCODE_SET).collect::<String>();
 
-    let sas = format!("SharedAccessSignature sig={}&se={}&skn={}&sr={}",
-                      sig,
-                      expiry,
-                      name,
-                      encoded_url);
+    let sas = format!(
+        "SharedAccessSignature sig={}&se={}&skn={}&sr={}",
+        sig, expiry, name, encoded_url
+    );
 
     (sas, expiry as usize)
 }
