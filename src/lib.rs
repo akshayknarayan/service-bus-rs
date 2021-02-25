@@ -8,3 +8,4 @@ pub mod core;
 /// They communicate messages through the BrokeredMessage struct.
 ///
 pub mod servicebus;
+pub use servicebus::{queue::QueueClient, subscription::SubscriptionClient};

@@ -27,17 +27,6 @@ const SAS_BUFFER_TIME: usize = 15;
 /// subscription will log every message as they come in in a different subscription. This way
 /// different processes can consume the message and not interfere with each other or have to worry
 /// about losing messages.
-///
-/// ```
-/// use std::thread;
-/// let queue = Arc::new(QueueClient::with_conn_and_queue(conn,queue_name));
-/// for _ in 0..10 {
-///     let q = queue.clone();
-///     thread::spawn(move || {
-///         q.send(BrokeredMessage::with_body("Sending a concurrent message"));
-///     });
-/// }
-/// ```
 #[derive(Clone)]
 pub struct QueueClient {
     endpoint: Uri,
@@ -90,14 +79,12 @@ impl QueueClient {
     /// Send a message to the queue. Consumes the message. If the serve returned an error
     /// Then this function will return an error. The default timeout is 30 seconds.
     ///
-    /// ```
-    /// use servicebus::brokeredmessage::BrokeredMessage;
+    /// ```no_run
+    /// # let my_queue: azure_service_bus::QueueClient = unimplemented!();
+    /// use azure_service_bus::servicebus::brokeredmessage::BrokeredMessage;
     ///
     /// let message = BrokeredMessage::with_body("This is a message");
-    /// match my_queue.send(message) {
-    ///     Ok(_) => println!("The message sent successfully"),
-    ///     Err(e) => println!("The error was: {:?}", e);
-    /// }
+    /// let req = my_queue.send(message).expect("error building request");
     /// ```
     pub fn send(&self, message: BrokeredMessage) -> Result<Request<String>, Report> {
         let timeout = Duration::from_secs(30);
@@ -130,7 +117,7 @@ impl QueueClient {
         let sas = self.refresh_sas();
         let mut parts = self.endpoint().clone().into_parts();
         parts.path_and_query =
-            Some(format!("{}/messages?timeout={}", self.queue(), timeout.as_secs()).parse()?);
+            Some(format!("/{}/messages?timeout={}", self.queue(), timeout.as_secs()).parse()?);
         let uri = Uri::from_parts(parts)?;
 
         Ok(Request::post(uri)
@@ -157,7 +144,7 @@ impl QueueClient {
         let mut parts = self.endpoint().clone().into_parts();
         parts.path_and_query = Some(
             format!(
-                "{}/messages/head?timeout={}",
+                "/{}/messages/head?timeout={}",
                 self.queue(),
                 timeout.as_secs()
             )
@@ -177,7 +164,7 @@ impl QueueClient {
         let mut parts = self.endpoint().clone().into_parts();
         parts.path_and_query = Some(
             format!(
-                "{}/messages/head?timeout={}",
+                "/{}/messages/head?timeout={}",
                 self.queue(),
                 timeout.as_secs()
             )
@@ -189,12 +176,6 @@ impl QueueClient {
 
     /// Completes a message that has been received from the Service Bus. This will fail
     /// if the message was created locally. Once a message is created, it cannot be restored
-    ///
-    /// ```
-    /// let message = my_queue.receive().unwrap();
-    /// // Do lots of processing with the message. Send it to another database.
-    /// my_queue.complete_message(message);
-    /// ```
     pub fn complete_message(&self, message: BrokeredMessage) -> Result<Request<()>, Report> {
         let sas = self.refresh_sas();
 
@@ -221,15 +202,20 @@ impl QueueClient {
     /// but not deleted on the Service Bus. This method allows the lock to be renewed
     /// if additional time is needed to finish processing the message.
     ///
-    /// ```
-    /// use std::thread::sleep;
-    ///
-    /// let message = queue.receive();
-    /// sleep(2*60*1000);
+    /// ```no_run
+    /// # use std::thread::sleep;
+    /// # use std::time::Duration;
+    /// # use azure_service_bus::servicebus::brokeredmessage::BrokeredMessage;
+    /// # fn exec<T>(_: hyper::Request<T>) ->  hyper::Response<BrokeredMessage> { unimplemented!() }
+    /// # fn main() -> Result<(), eyre::Report> {
+    /// # let queue: azure_service_bus::QueueClient = unimplemented!();
+    /// let message = exec(queue.receive()?).into_body();
+    /// sleep(Duration::from_secs(10));
     /// //Renew the lock on the message so that we can keep processing it.
-    /// queue.renew_message(message);
-    /// sleep(2*60*1000);
-    /// queue.complete_message(message);
+    /// exec(queue.renew_message(&message)?);
+    /// sleep(Duration::from_secs(10));
+    /// exec(queue.complete_message(message)?);
+    /// # }
     /// ```
     pub fn renew_message(&self, message: &BrokeredMessage) -> Result<Request<()>, Report> {
         let sas = self.refresh_sas();
@@ -278,126 +264,77 @@ impl QueueClient {
     }
 }
 
-/*
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::servicebus::brokeredmessage::BrokeredMessage;
+    use super::QueueClient;
+    use crate::servicebus::{
+        brokeredmessage::{BrokerProperties, BrokeredMessage},
+        interpret_results,
+    };
+    use eyre::Report;
+    use hyper::Request;
+    use std::convert::TryInto;
+
+    fn get_conn_string() -> Result<String, Report> {
+        Ok(std::env::var("AZ_CONNECTION_STRING")?)
+    }
+
+    trait Exec {
+        fn exec(self) -> Result<reqwest::blocking::Response, Report>;
+    }
+
+    impl Exec for Request<String> {
+        fn exec(self) -> Result<reqwest::blocking::Response, Report> {
+            Ok(reqwest::blocking::Client::new().execute(self.try_into()?)?)
+        }
+    }
+
+    impl Exec for Request<()> {
+        fn exec(self) -> Result<reqwest::blocking::Response, Report> {
+            let (parts, _) = self.into_parts();
+            Request::from_parts(parts, String::new()).exec()
+        }
+    }
 
     #[test]
-    fn queue_send_message() {
-        let queue = QueueClient::with_conn_and_queue(&CONNECTION_STRING, "test1").unwrap();
+    fn queue_send_message() -> Result<(), Report> {
+        let queue = QueueClient::with_conn_and_queue(&get_conn_string()?, "test1").unwrap();
         let message = BrokeredMessage::with_body("Cats and Dogs");
-        match queue.send(message) {
-            Err(e) => {
-                println!("{:?}", e);
-                panic!("Failed to send message.")
-            }
-            _ => assert!(true),
-        }
+        Ok(interpret_results(queue.send(message)?.exec()?.status())?)
     }
 
     #[test]
-    fn queue_receive_message() {
-        let queue = QueueClient::with_conn_and_queue(&CONNECTION_STRING, "test1").unwrap();
-        match queue.receive_and_delete() {
-            Err(e) => {
-                println!("{:?}", e);
-                panic!("Failed to receive message.")
-            }
-            Ok(_) => {}
-        }
+    fn queue_receive_message() -> Result<(), Report> {
+        let queue = QueueClient::with_conn_and_queue(&get_conn_string()?, "test1").unwrap();
+        Ok(interpret_results(
+            queue.receive_and_delete()?.exec()?.status(),
+        )?)
+    }
+
+    fn queue_send_recv(queue: &QueueClient) -> Result<BrokeredMessage, Report> {
+        interpret_results(
+            queue
+                .send(BrokeredMessage::with_body("test message"))?
+                .exec()?
+                .status(),
+        )?;
+
+        let resp = queue.receive()?.exec()?;
+        interpret_results(resp.status())?;
+        let props = resp
+            .headers()
+            .get(crate::servicebus::brokeredmessage::BROKER_PROPERTIES_HEADER)
+            .and_then(|header| serde_json::from_str::<BrokerProperties>(header.to_str().ok()?).ok())
+            .unwrap_or(Default::default());
+        Ok(BrokeredMessage::with_body_and_props(&resp.text()?, props))
     }
 
     #[test]
-    fn queue_complete_message() {
-        let queue = QueueClient::with_conn_and_queue(&CONNECTION_STRING, "test1").unwrap();
-        queue
-            .send(BrokeredMessage::with_body("Complete this message"))
-            .unwrap();
-        match queue.receive() {
-            Err(e) => {
-                println!("{:?}", e);
-                panic!("Failed to receive message.")
-            }
-            Ok(message) => match queue.complete_message(message.clone()) {
-                Err(e) => {
-                    println!("{:?}", e);
-                    println!("{:?}", message);
-                    panic!("Failed to complete the message");
-                }
-                _ => {}
-            },
-        }
-    }
-
-    #[test]
-    fn queue_abandon_message() {
-        let queue = QueueClient::with_conn_and_queue(&CONNECTION_STRING, "test1").unwrap();
-        queue
-            .send(BrokeredMessage::with_body("Complete this message"))
-            .unwrap();
-        match queue.receive() {
-            Err(e) => {
-                println!("{:?}", e);
-                panic!("Failed to receive message.")
-            }
-            Ok(message) => match queue.abandon_message(message.clone()) {
-                Err(e) => {
-                    println!("{:?}", e);
-                    println!("{:?}", message);
-                    panic!("Failed to abandon the message");
-                }
-                _ => {}
-            },
-        }
-    }
-
-    #[test]
-    fn queue_renew_message() {
-        let queue = QueueClient::with_conn_and_queue(&CONNECTION_STRING, "test1").unwrap();
-        queue
-            .send(BrokeredMessage::with_body("Complete this message"))
-            .unwrap();
-        match queue.receive() {
-            Err(e) => {
-                println!("{:?}", e);
-                panic!("Failed to receive message.")
-            }
-            Ok(message) => match queue.renew_message(message.clone()) {
-                Err(e) => {
-                    println!("{:?}", e);
-                    println!("{:?}", message);
-                    panic!("Failed to renew the message");
-                }
-                _ => {}
-            },
-        }
-    }
-
-    #[test]
-    fn conncurrent_queue_send_message() {
-        let queue = QueueClient::with_conn_and_queue(&CONNECTION_STRING, "test1").unwrap();
-        let message = BrokeredMessage::with_body("Cats and Dogs");
-        match queue.send(message) {
-            Err(e) => {
-                println!("{:?}", e);
-                panic!("Failed to send message.");
-            }
-            _ => {}
-        }
-    }
-
-    #[test]
-    fn concurrent_queue_receive_message() {
-        let queue = QueueClient::with_conn_and_queue(&CONNECTION_STRING, "test1").unwrap();
-        match queue.receive_and_delete() {
-            Err(e) => {
-                println!("{:?}", e);
-                panic!("Failed to receive a message");
-            }
-            Ok(_) => {}
-        }
+    fn queue_complete_message() -> Result<(), Report> {
+        let queue = QueueClient::with_conn_and_queue(&get_conn_string()?, "test1").unwrap();
+        let message = queue_send_recv(&queue)?;
+        Ok(interpret_results(
+            queue.complete_message(message)?.exec()?.status(),
+        )?)
     }
 }
-*/

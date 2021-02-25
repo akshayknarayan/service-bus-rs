@@ -115,7 +115,7 @@ impl SubscriptionClient {
         let mut parts = self.endpoint().clone().into_parts();
         parts.path_and_query = Some(
             format!(
-                "{}/subscriptions/{}/messages/head?timeout={}",
+                "/{}/subscriptions/{}/messages/head?timeout={}",
                 self.topic(),
                 self.subscription(),
                 timeout.as_secs()
@@ -136,7 +136,7 @@ impl SubscriptionClient {
         let mut parts = self.endpoint().clone().into_parts();
         parts.path_and_query = Some(
             format!(
-                "{}/subscriptions/{}/messages/head?timeout={}",
+                "/{}/subscriptions/{}/messages/head?timeout={}",
                 self.topic(),
                 self.subscription(),
                 timeout.as_secs()
@@ -150,12 +150,6 @@ impl SubscriptionClient {
 
     /// Completes a message that has been received from the Service Bus. This will fail
     /// if the message was created locally. Once a message is created, it cannot be restored
-    ///
-    /// ```
-    /// let message = my_subscription.receive().unwrap();
-    /// // Do lots of processing with the message. Send it to another database.
-    /// my_subscription.complete_message(message);
-    /// ```
     pub fn complete_message(&self, message: BrokeredMessage) -> Result<Request<()>, Report> {
         let sas = self.refresh_sas();
         let target = self.get_message_update_path(&message)?;
@@ -177,17 +171,6 @@ impl SubscriptionClient {
     /// `subscription.receive()` or `subscription.receive_with_timeout()` then the message is locked
     /// but not deleted on the Service Bus. This method allows the lock to be renewed
     /// if additional time is needed to finish processing the message.
-    ///
-    /// ```
-    /// use std::thread::sleep;
-    ///
-    /// let message = subscription.receive();
-    /// sleep(2*60*1000);
-    /// //Renew the lock on the message so that we can keep processing it.
-    /// subscription.renew_message(message);
-    /// sleep(2*60*1000);
-    /// subscription.complete_message(message);
-    /// ```
     pub fn renew_message(&self, message: &BrokeredMessage) -> Result<Request<()>, Report> {
         let sas = self.refresh_sas();
         let target = self.get_message_update_path(&message)?;
@@ -207,7 +190,7 @@ impl SubscriptionClient {
             .and_then(|id| message.props.LockToken.as_ref().map(|lock| (id, lock)))
             .map(|(id, lock)| {
                 format!(
-                    "{}/subscriptions/{}/messages/{}/{}",
+                    "/{}/subscriptions/{}/messages/{}/{}",
                     self.topic(),
                     self.subscription(),
                     id,

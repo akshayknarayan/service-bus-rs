@@ -51,19 +51,6 @@ pub struct BrokerProperties {
 ///
 /// BrokeredMessage has unique clone behavior. It is possible to clone a message and then
 /// perform actions on it that fail because the message no longer exists on the server.
-///
-/// ````
-/// let message = client.receive();
-/// let message2 = message.clone();
-///
-/// // The message is deleted on the server here.
-/// client.complete_message(message);
-///
-/// // Continue working with message2;
-///
-/// // This will fail because the message has already been completed once.
-/// client.complete_message(messsage2)
-/// ````
 #[derive(Clone, Eq, PartialEq, Debug)]
 pub struct BrokeredMessage {
     pub props: Box<BrokerProperties>,
@@ -76,9 +63,7 @@ impl BrokeredMessage {
     ///
     /// Your message will be serialized into:
     ///
-    /// ```
-    /// <string>Heres your message</string>
-    /// ```
+    /// `<string>Heres your message</string>`
     ///
     /// This library will correctly deserialize your message and it is designed to
     /// be deserializeable by a .Net client as well.
